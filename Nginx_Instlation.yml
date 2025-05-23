@@ -1,0 +1,16 @@
+---
+- name: Install Nginx on Rocky 
+  hosts: all # Or a specific group like 'webservers' in your inventory
+  become: true # This allows Ansible to run tasks with sudo/root privileges
+
+  tasks:
+    - name: Ensure Nginx is installed
+      ansible.builtin.dnf:
+        name: nginx
+        state: present # Ensures the package is installed
+
+    - name: Ensure Nginx service is running and enabled
+      ansible.builtin.systemd:
+        name: nginx
+        state: started # Ensures the service is running
+        enabled: true  # Ensures the service starts on boot

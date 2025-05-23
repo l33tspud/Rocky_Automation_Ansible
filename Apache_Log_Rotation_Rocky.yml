@@ -1,0 +1,52 @@
+---
+- name: Configure Apache Log Rotation on Rocky 
+  hosts: all # Or your 'webservers' group
+  become: true
+
+  tasks:
+    - name: Ensure logrotate package is installed
+      ansible.builtin.dnf:
+        name: logrotate
+        state: present
+
+    - name: Copy custom logrotate configuration for Apache access logs
+      ansible.builtin.copy:
+        content: |
+          /var/log/httpd/access_log {
+              daily        # Rotate logs daily
+              rotate 30    # Keep 30 old log files
+              compress     # Compress old log files
+              delaycompress # Delay compression of the previous log file
+              missingok    # Don't error if the log file is missing
+              notifempty   # Don't rotate if the log file is empty
+              create 0640 root adm # Create new log file with these permissions
+              sharedscripts # Ensure scripts are run only once for all files in the group
+              postrotate   # Command to run after rotation
+                  /bin/systemctl reload httpd.service > /dev/null 2>&1 || true
+              endscript
+          }
+        dest: /etc/logrotate.d/apache_access
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Reload logrotate configuration # Although logrotate runs via cron,
+                                            # a 'notify' could be used if you
+                                            # wanted to force a run or reload
+                                            # a service dependent on logrotate's
+                                            # successful config update.
+                                            # For logrotate itself, this notify
+                                            # is mostly illustrative.
+
+  # Handlers are typically used to restart services when their config changes
+  # For logrotate, changes take effect on the next cron run, so a handler
+  # for the logrotate service itself isn't strictly necessary unless you want
+  # to trigger a reload of its internal state, which is not common practice.
+  # If this was for a service like Apache, it would be 'systemctl reload httpd'.
+  # For logrotate, the 'postrotate' script inside the config handles service needs.
+  # handlers:
+  #   - name: Reload logrotate configuration
+  #     ansible.builtin.systemd:
+  #       name: logrotate.timer # Or logrotate.service, depending on setup
+  #       state: reloaded
+  #     # This handler is often not needed as logrotate itself is usually
+  #     # triggered by a cron job and reads the latest configuration on each run.

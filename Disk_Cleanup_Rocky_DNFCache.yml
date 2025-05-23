@@ -1,0 +1,32 @@
+---
+- name: Clean Up Temporary Files and DNF Cache on Rocky
+  hosts: all # Or your specific Rocky 8 server group
+  become: true
+
+  tasks:
+    - name: Clean DNF cache
+      ansible.builtin.command: dnf clean all
+      args:
+        warn: false # Suppress warning about using 'command' module
+
+    - name: Remove old package-related files from DNF cache directory
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /var/cache/dnf/*
+        - /var/tmp/dnf-*
+
+    - name: Clean up temporary files in /tmp (older than 7 days)
+      ansible.builtin.command: find /tmp -type f -atime +7 -delete
+      args:
+        warn: false
+      # Note: Be cautious with recursive deletion in /tmp.
+      # This example only deletes files, not directories.
+      # For more robust /tmp cleanup, consider using the 'tmpwatch' utility
+      # or configuring systemd-tmpfiles (which Rocky 8 uses by default).
+
+    - name: Clean up empty directories in /tmp
+      ansible.builtin.command: find /tmp -type d -empty -delete
+      args:
+        warn: false

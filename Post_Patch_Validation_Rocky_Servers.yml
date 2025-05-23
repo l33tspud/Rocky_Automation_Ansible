@@ -1,0 +1,119 @@
+---
+# Define the name of this validation playbook.
+- name: Post-Patch Security Validation for Rocky Servers (ISSM View)
+  # Target the 'rocky_servers' group defined in your Ansible inventory.
+  hosts: rocky_servers
+  # Enable privilege escalation (sudo/root) for tasks that require it,
+  # like reading DNF history or certain system files.
+  become: true
+  # Gather facts about the remote hosts at the beginning of the playbook.
+  # This provides system information useful for some checks, though most here
+  # rely on direct command execution.
+  gather_facts: true
+
+  # No specific variables defined for this validation playbook as most checks
+  # are direct system queries rather than configurable thresholds or service names.
+
+  # Define the sequence of validation tasks.
+  tasks:
+    - name: Ensure SSH connectivity is established
+      # This task verifies that the Ansible control node can successfully connect
+      # to the target server via SSH. It's a foundational check that the server
+      # is online and reachable.
+      ansible.builtin.wait_for_connection:
+        # Sets a timeout (in seconds) for how long Ansible will wait for SSH.
+        timeout: 300 # Wait up to 5 minutes
+
+    - name: Get Last System Reboot Date and Time
+      # Execute the `uptime -s` command to get the precise date and time of the last system boot.
+      # This is the most accurate way to determine the last reboot event.
+      ansible.builtin.command: uptime -s
+      # Indicate that this command does not change the system state.
+      changed_when: false
+      # Store the output in a variable for display.
+      register: last_boot_date_time
+
+    - name: Display Last System Reboot Date and Time
+      # Use the `debug` module to print the collected information clearly.
+      ansible.builtin.debug:
+        msg: "Last System Reboot Date/Time: {{ last_boot_date_time.stdout | default('N/A - Could not determine uptime.') }}"
+
+    - name: Get Date of Last Package Upgrade Transaction
+      # Use `dnf history list` to get the list of DNF transactions.
+      # `head -n 2 | tail -n 1` extracts the last transaction line (excluding header).
+      # This line contains the transaction ID, command, and crucially, the date.
+      ansible.builtin.command: dnf history list | head -n 2 | tail -n 1
+      changed_when: false
+      register: dnf_last_transaction_line
+      # Ignore errors in case DNF history is empty or command fails.
+      ignore_errors: true
+
+    - name: Display Date of Last Package Upgrade
+      ansible.builtin.debug:
+        # Attempt to extract and display the date from the DNF history line.
+        # This uses string manipulation (`split()`) to get the relevant part of the line.
+        # If the command failed or returned unexpected output, it defaults to 'N/A'.
+        msg: "Date of Last Package Upgrade: {{ dnf_last_transaction_line.stdout.split(' | ')[2] | default('N/A - Could not determine from DNF history.') }}"
+      # This task only runs if the previous DNF history command was successful.
+      when: dnf_last_transaction_line.rc == 0 and dnf_last_transaction_line.stdout | length > 0
+
+    - name: Get Current Active Kernel Version and Build Date
+      # Execute `uname -a` to get comprehensive system information,
+      # which includes the active kernel version, hostname, OS, and build date.
+      # This is vital to confirm kernel updates have taken effect after a reboot.
+      ansible.builtin.command: uname -a
+      changed_when: false
+      register: uname_output
+
+    - name: Display Current Active Kernel Version and Build Date
+      # Display the full output of `uname -a` for the validator.
+      ansible.builtin.debug:
+        msg: "Current Active Kernel Version and Build Date: {{ uname_output.stdout | default('N/A - Could not retrieve kernel info.') }}"
+
+    - name: Get Date of Last ClamAV Freshclam Database Update
+      # Attempt to get the modification time (last updated date) of the main ClamAV database file.
+      # This is a direct way to verify how recent the antivirus definitions are.
+      ansible.builtin.stat:
+        path: /var/lib/clamav/daily.cvd # Or main.cvd, depending on which is newer/preferred
+      register: freshclam_db_stat
+      # Ignore errors if ClamAV is not installed or the file doesn't exist.
+      ignore_errors: true
+
+    - name: Display Date of Last ClamAV Freshclam Update
+      ansible.builtin.debug:
+        # Display the formatted modification date of the ClamAV database.
+        # If the file doesn't exist or `stat` failed, it indicates ClamAV might not be present or updated.
+        msg: >
+          ClamAV Freshclam Last Database Update:
+          {% if freshclam_db_stat.stat.exists %}
+          {{ freshclam_db_stat.stat.mtime | int | to_datetime | strftime('%Y-%m-%d %H:%M:%S %Z') }}
+          {% else %}
+          N/A - ClamAV database file not found or ClamAV not installed/updated.
+          {% endif %}
+
+    - name: Check if Java Processes are Running
+      # Use `pgrep java` to check for any running processes containing 'java' in their name.
+      # This is a common and quick way to verify if Java applications or JVMs are active.
+      # `pgrep` returns 0 if matches are found, 1 if no matches.
+      ansible.builtin.shell: pgrep java
+      # Indicate that this command does not change the system state.
+      changed_when: false
+      # `failed_when: false` ensures the task doesn't fail the playbook if no Java processes are found.
+      failed_when: false
+      register: java_processes_check
+
+    - name: Display Java Running Status
+      ansible.builtin.debug:
+        # Based on the return code of `pgrep java`, determine if Java is running.
+        msg: >
+          Java Running Status:
+          {% if java_processes_check.rc == 0 %}
+          Yes, Java processes found. PIDs: {{ java_processes_check.stdout | default('N/A') }}
+          {% else %}
+          No, Java processes not found.
+          {% endif %}
+
+    - name: Final Validation Summary
+      # A concluding message for the validator.
+      ansible.builtin.debug:
+        msg: "Post-patch security validation complete for {{ inventory_hostname }}. Review the output above for critical system and security-related dates and statuses."

@@ -1,0 +1,27 @@
+---
+- name: Perform Full System Update on Rocky 
+  hosts: all # Or a specific group like 'rocky_servers'
+  become: true
+
+  tasks:
+    - name: Update all packages to the latest version
+      ansible.builtin.dnf:
+        name: "*" # Update all packages
+        state: latest
+        update_cache: true # Ensures dnf cache is refreshed before updating
+      register: dnf_update_result
+
+    - name: Check if reboot is required
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required_file
+
+    - name: Reboot if required
+      ansible.builtin.reboot:
+        reboot_timeout: 600 # Wait up to 10 minutes for reboot
+      when: reboot_required_file.stat.exists or "kernel" in dnf_update_result.results | map(attribute='changes') | join(',')
+      # The 'reboot_required_file' is more reliable for general system updates.
+      # The "kernel" check is a fallback/additional check, as dnf doesn't always create /var/run/reboot-required for kernel updates.
+      # Note: dnf_update_result.results | map(attribute='changes') | join(',') is a more complex way to check for kernel in changes,
+      # a simpler check on "kernel" in dnf_update_result.stdout could also be considered if dnf_update_result.results is too verbose.
+      # However, the existence of /var/run/reboot-required is the most standard method.

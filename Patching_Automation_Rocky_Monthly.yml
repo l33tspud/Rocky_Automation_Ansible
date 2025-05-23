@@ -1,0 +1,308 @@
+---
+# Define the name of the playbook for clear identification in Ansible output
+- name: Automated Monthly Security Patching for Rocky Servers (Mandatory Reboot & Kernel Version Check)
+  # Specify the target group of hosts from your inventory file
+  hosts: rocky_servers
+  # Enable privilege escalation (equivalent to `sudo`) for all tasks in this playbook
+  become: true
+  # Automatically gather facts about the remote hosts at the start of the playbook run.
+  # This provides variables like `ansible_mounts`, `ansible_memfree_mb`, `ansible_loadavg_1m`, etc., used in pre-checks.
+  gather_facts: true
+
+  # Define variables that can be easily customized for your environment or thresholds
+  vars:
+    # --- Pre-check Thresholds ---
+    # Minimum percentage of free disk space required on the '/' (root) filesystem.
+    # If less than this, the playbook will fail the pre-check.
+    disk_space_threshold_percent: 10
+    # Minimum amount of free RAM (in Megabytes) required on the server.
+    # If less than this, the playbook will fail the pre-check.
+    memory_free_threshold_mb: 512
+    # Maximum acceptable 1-minute load average.
+    # If the load average exceeds this, the pre-check will fail, indicating the server is too busy to patch.
+    load_average_threshold: 5.0
+    # Maximum number of running processes allowed.
+    # If too many processes are running, it might indicate an issue or a busy server.
+    running_processes_threshold: 500
+    # --- Post-check Parameters ---
+    # Name of the Apache web server service. Leave empty ("") if Apache is not installed/used.
+    apache_service_name: httpd
+    # Name of the Nginx web server service. Leave empty ("") if Nginx is not installed/used.
+    nginx_service_name: nginx
+    # Example: Name of a database service (e.g., 'postgresql', 'mariadb'). Leave empty ("") if not applicable.
+    database_service_name: postgresql
+    # Common port to check for application availability (e.g., 80 for HTTP, 443 for HTTPS).
+    # Leave empty ("") if no specific port check is needed.
+    app_port_to_check: 80
+    # A specific URL endpoint for checking application health (e.g., a '/healthz' endpoint).
+    # This URL is expected to return a 200 OK status for a healthy application.
+    # Leave empty ("") if no application health check is needed.
+    app_url_to_check: "http://localhost/healthz"
+
+  # Define tasks that run *before* the main patching process begins.
+  # These are crucial for ensuring the server is in a suitable state for updates.
+  pre_tasks:
+    - name: Pre-check - Ensure enough disk space on /
+      # The `assert` module is used to explicitly check conditions and fail the playbook if they are not met.
+      ansible.builtin.assert:
+        # The `that` clause defines the condition(s) to be evaluated.
+        # It calculates the percentage of available disk space on the root filesystem (/) and checks if it's above the threshold.
+        that:
+          - (ansible_mounts | selectattr('mount', 'equal to', '/') | map(attribute='size_available') | first / ansible_mounts | selectattr('mount', 'equal to', '/') | map(attribute='size_total') | first * 100) | int > disk_space_threshold_percent
+        # Message displayed if the assertion fails.
+        fail_msg: "Pre-check failed: Less than {{ disk_space_threshold_percent }}% free disk space on /."
+        # Message displayed if the assertion passes.
+        success_msg: "Pre-check passed: Sufficient disk space available."
+
+    - name: Pre-check - Ensure enough free memory
+      ansible.builtin.assert:
+        # Checks if the amount of free memory (in MB) is above the defined threshold.
+        that:
+          - (ansible_memfree_mb | int) > memory_free_threshold_mb
+        fail_msg: "Pre-check failed: Less than {{ memory_free_threshold_mb }}MB free memory."
+        success_msg: "Pre-check passed: Sufficient free memory available."
+
+    - name: Pre-check - Check system load average (1 minute)
+      ansible.builtin.assert:
+        # Checks if the 1-minute load average is below the defined threshold.
+        # High load average might indicate the server is too busy for patching.
+        that:
+          - (ansible_loadavg_1m | float) < load_average_threshold
+        fail_msg: "Pre-check failed: High 1-minute load average ({{ ansible_loadavg_1m }}). Threshold: {{ load_average_threshold }}."
+        success_msg: "Pre-check passed: Load average is acceptable."
+
+    - name: Pre-check - Count running processes
+      # Execute the `ps -e | wc -l` command to count all running processes.
+      ansible.builtin.command: ps -e | wc -l
+      # Prevents Ansible from reporting this task as "changed" even if the command output changes.
+      changed_when: false
+      # Register the output of the command into a variable for later use.
+      register: process_count_result
+
+    - name: Pre-check - Assert running processes are within limits
+      ansible.builtin.assert:
+        # Checks if the number of running processes is below the defined threshold.
+        that:
+          - (process_count_result.stdout | int) < running_processes_threshold
+        fail_msg: "Pre-check failed: Too many running processes ({{ process_count_result.stdout }}). Threshold: {{ running_processes_threshold }}."
+        success_msg: "Pre-check passed: Number of running processes is acceptable."
+
+    - name: Pre-check - Check DNF last successful update timestamp
+      # Uses the `stat` command to get the modification timestamp of a DNF cache file.
+      # This helps determine when the last successful DNF update occurred.
+      ansible.builtin.command: stat -c %Y /var/cache/dnf/timedhosts.txt
+      changed_when: false
+      # Ignores errors if the file doesn't exist (e.g., on a newly provisioned server).
+      ignore_errors: true
+      register: dnf_last_update_ts
+
+    - name: Pre-check - Report last DNF update
+      # Displays the last DNF update timestamp in a human-readable format.
+      ansible.builtin.debug:
+        msg: "Last DNF update was on {{ dnf_last_update_ts.stdout | default(0) | int | to_datetime | strftime('%Y-%m-%d %H:%M:%S') }} UTC"
+      # This task only runs if the `stat` command in the previous task was successful.
+      when: dnf_last_update_ts.rc == 0
+
+    - name: Pre-check - Gather installed package list (for diffing later if needed)
+      # Executes `dnf list installed` to get a list of all currently installed packages.
+      # This list can be saved and later compared with a post-update list to identify changes.
+      ansible.builtin.command: dnf list installed
+      changed_when: false
+      register: initial_installed_packages
+      # Uncomment the following task if you want to save this list to a file on the remote host:
+      # - name: Save initial package list
+      #   ansible.builtin.copy:
+      #     content: "{{ initial_installed_packages.stdout }}"
+      #     dest: "/tmp/initial_packages_{{ inventory_hostname }}.txt"
+
+  # The main execution block for the patching process.
+  tasks:
+    - name: Ensure DNF cache is fresh
+      # Ensures that the DNF package cache is updated before attempting to apply patches.
+      # This guarantees Ansible works with the latest available package information.
+      ansible.builtin.dnf:
+        update_cache: true
+
+    - name: Apply all available updates, including security and kernel updates
+      # Uses the `dnf` module to update all packages (`name: "*"`) to their `latest` versions.
+      # `security: true` prioritizes security-related updates.
+      # `bugfix: true` includes bugfix updates in addition to security updates.
+      ansible.builtin.dnf:
+        name: "*"
+        state: latest
+        security: true
+        bugfix: true
+        # Uncomment and add package names here if you need to exclude specific packages from updates.
+        # For example: exclude: 'kernel*' to prevent kernel updates.
+        # exclude:
+      register: dnf_update_result
+
+    - name: Notify about DNF update results
+      # Displays a summary of the DNF update operation, including whether changes occurred.
+      ansible.builtin.debug:
+        msg: "DNF update status: changed={{ dnf_update_result.changed }}, rc={{ dnf_update_result.rc }}, msg={{ dnf_update_result.msg | default('N/A') }}"
+      # This task runs only if `dnf_update_result` variable was successfully registered.
+      when: dnf_update_result is defined
+
+    - name: Mandatory Reboot after updates
+      # The `reboot` module handles the server reboot and waits for it to come back online.
+      ansible.builtin.reboot:
+        # Sets a timeout (in seconds) for how long Ansible will wait for the server to reboot and become reachable again.
+        reboot_timeout: 600 # Wait up to 10 minutes
+      # This task will execute *only if* the `dnf_update_result.changed` variable is true,
+      # meaning that the DNF update task actually applied some changes. This prevents unnecessary reboots.
+      when: dnf_update_result.changed
+
+    - name: Wait for SSH to be available after the mandatory reboot
+      # Ensures that Ansible can re-establish an SSH connection to the server after the reboot.
+      # This is critical for all subsequent post-check tasks to run successfully.
+      ansible.builtin.wait_for_connection:
+        # Sets a timeout (in seconds) for how long Ansible will wait for the SSH connection.
+        timeout: 300 # Wait up to 5 minutes for SSH to be back
+
+  # Define tasks that run *after* the main patching and reboot process.
+  # These are crucial for validating the health and functionality of the server post-update.
+  post_tasks:
+    - name: Post-check - Verify system uptime (should reflect recent reboot)
+      # Executes `uptime -p` to get a human-readable uptime string.
+      ansible.builtin.command: uptime -p
+      changed_when: false
+      register: uptime_result
+
+    - name: Post-check - Display system uptime
+      # Displays the uptime information collected in the previous task.
+      ansible.builtin.debug:
+        msg: "System Uptime: {{ uptime_result.stdout }}"
+
+    - name: Post-check - Get current kernel version and build date
+      # Executes `uname -a` to get detailed system information, including the active kernel version and build date.
+      # This is crucial to confirm that kernel updates have taken effect after the reboot.
+      ansible.builtin.command: uname -a
+      changed_when: false
+      register: uname_output
+
+    - name: Post-check - Display current kernel version and build date
+      # Displays the output of the `uname -a` command.
+      ansible.builtin.debug:
+        msg: "Current active kernel and build info: {{ uname_output.stdout }}"
+
+    - name: Post-check - Verify service status (Apache example)
+      # Checks the status of the Apache service using the `systemd` module.
+      ansible.builtin.systemd:
+        name: "{{ apache_service_name }}"
+      register: apache_status_check
+      # Ignores errors if the service is not found or not active, allowing subsequent checks to proceed.
+      ignore_errors: true
+      # This task runs only if `apache_service_name` variable is defined and not empty.
+      when: apache_service_name is defined and apache_service_name != ""
+
+    - name: Post-check - Assert Apache service is active
+      ansible.builtin.assert:
+        # Checks if the `ActiveState` of the Apache service is 'active'.
+        that:
+          - apache_status_check.status.ActiveState == 'active'
+        fail_msg: "Post-check failed: Apache service ({{ apache_service_name }}) is not active!"
+        success_msg: "Post-check passed: Apache service ({{ apache_service_name }}) is active."
+      # This assertion only runs if the `systemd` task for Apache ran and didn't fail, and `ActiveState` is defined.
+      when: apache_status_check is defined and not apache_status_check.failed and apache_status_check.status.ActiveState is defined
+
+    - name: Post-check - Verify service status (Nginx example)
+      # Checks the status of the Nginx service.
+      ansible.builtin.systemd:
+        name: "{{ nginx_service_name }}"
+      register: nginx_status_check
+      ignore_errors: true
+      # This task runs only if `nginx_service_name` variable is defined and not empty.
+      when: nginx_service_name is defined and nginx_service_name != ""
+
+    - name: Post-check - Assert Nginx service is active
+      ansible.builtin.assert:
+        # Checks if the `ActiveState` of the Nginx service is 'active'.
+        that:
+          - nginx_status_check.status.ActiveState == 'active'
+        fail_msg: "Post-check failed: Nginx service ({{ nginx_service_name }}) is not active!"
+        success_msg: "Post-check passed: Nginx service ({{ nginx_service_name }}) is active."
+      # This assertion only runs if the `systemd` task for Nginx ran and didn't fail, and `ActiveState` is defined.
+      when: nginx_status_check is defined and not nginx_status_check.failed and nginx_status_check.status.ActiveState is defined
+
+    - name: Post-check - Verify service status (Database example)
+      # Checks the status of a specified database service.
+      ansible.builtin.systemd:
+        name: "{{ database_service_name }}"
+      register: db_status_check
+      ignore_errors: true
+      # This task runs only if `database_service_name` variable is defined and not empty.
+      when: database_service_name is defined and database_service_name != ""
+
+    - name: Post-check - Assert Database service is active
+      ansible.builtin.assert:
+        # Checks if the `ActiveState` of the database service is 'active'.
+        that:
+          - db_status_check.status.ActiveState == 'active'
+        fail_msg: "Post-check failed: Database service ({{ database_service_name }}) is not active!"
+        success_msg: "Post-check passed: Database service ({{ database_service_name }}) is active."
+      # This assertion only runs if the `systemd` task for the database ran and didn't fail, and `ActiveState` is defined.
+      when: db_status_check is defined and not db_status_check.failed and db_status_check.status.ActiveState is defined
+
+    - name: Post-check - Check application health endpoint (if applicable)
+      # Uses the `uri` module to make an HTTP request to a specified application health check URL.
+      ansible.builtin.uri:
+        url: "{{ app_url_to_check }}"
+        status_code: 200 # Expects an HTTP 200 OK response for a healthy application.
+        timeout: 10      # Sets a timeout for the HTTP request.
+      register: app_health_check
+      ignore_errors: true
+      # This task runs only if `app_url_to_check` variable is defined and not empty.
+      when: app_url_to_check is defined and app_url_to_check != ""
+
+    - name: Post-check - Assert application health endpoint is reachable
+      ansible.builtin.assert:
+        # Checks if the HTTP status code returned from the health check URL is 200.
+        that:
+          - app_health_check.status == 200
+        fail_msg: "Post-check failed: Application health check failed for {{ app_url_to_check }}. Status: {{ app_health_check.status | default('N/A') }}"
+        success_msg: "Post-check passed: Application health check successful for {{ app_url_to_check }}."
+      # This assertion only runs if the `uri` task ran and didn't fail.
+      when: app_health_check is defined and not app_health_check.failed
+
+    - name: Post-check - Verify listening ports (e.g., web server)
+      # Uses the `wait_for` module to check if a specific port is listening on the target host.
+      ansible.builtin.wait_for:
+        port: "{{ app_port_to_check }}" # The port number to check.
+        timeout: 5 # Short timeout, just checking if port is actively listening.
+        host: "{{ ansible_host | default(inventory_hostname) }}" # Checks the port on the target host itself.
+        state: started # Asserts that the port is in a 'started' (listening) state.
+      # `delegate_to: localhost` means this task runs on the Ansible control node,
+      # connecting *to* the target host's specified port.
+      delegate_to: localhost
+      register: port_check_result
+      ignore_errors: true
+      # This task runs only if `app_port_to_check` variable is defined and not empty.
+      when: app_port_to_check is defined and app_port_to_check != ""
+
+    - name: Post-check - Assert required port is listening
+      ansible.builtin.assert:
+        # Checks if the port is reported as 'started' (listening).
+        that:
+          - port_check_result.state == 'started'
+        fail_msg: "Post-check failed: Port {{ app_port_to_check }} is not listening!"
+        success_msg: "Post-check passed: Port {{ app_port_to_check }} is listening."
+      # This assertion only runs if the `wait_for` task ran and didn't fail.
+      when: port_check_result is defined and not port_check_result.failed
+
+    - name: Post-check - Re-gather installed package list (for diffing later if needed)
+      # Re-gathers the list of installed packages after updates and reboot.
+      # This can be compared with `initial_installed_packages` to see what changed.
+      ansible.builtin.command: dnf list installed
+      changed_when: false
+      register: final_installed_packages
+      # Uncomment the following task if you want to save this list to a file on the remote host:
+      # - name: Save final package list
+      #   ansible.builtin.copy:
+      #     content: "{{ final_installed_packages.stdout }}"
+      #     dest: "/tmp/final_packages_{{ inventory_hostname }}.txt"
+
+    - name: Post-check - Notify completion of patching
+      # Final debug message indicating the completion of the patching process.
+      ansible.builtin.debug:
+        msg: "Patching process completed on {{ inventory_hostname }}. Review logs for details."
